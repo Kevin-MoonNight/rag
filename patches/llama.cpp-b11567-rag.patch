@@ -1,0 +1,1226 @@
+diff -ruN a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/common/speculative.cpp	2026-10-15 15:06:10.158089900 +0000
+@@ -1408,6 +1408,7 @@
+     int32_t n_mtp_layers  = 1;
+     bool    is_mem_shared = false;   // gemma4
+     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
++    bool    tgt_masked    = false;   // [rag] the target extracts h_nextn for the output rows only
+ 
+     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
+     // The last h-row of one process() call needs the first token of the NEXT
+@@ -1475,12 +1476,18 @@
+             }
+         }
+ 
+-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+-
+         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
++        // [rag] when the draft shares the target KV (gemma4) there is no catch-up decode, so only the hidden
++        // state of the output rows is ever read (the last prompt row, and every row of a verification batch).
++        // extracting just those keeps crop_before_nextn() true, so the target can still skip the KV-shared
++        // layers for the prompt rows that are not output (the "early output crop" in gemma4.cpp).
++        tgt_masked = is_mem_shared && getenv("RAG_MTP_UNMASKED") == nullptr;
++
++        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ tgt_masked);
++        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
++
+         if (chain_heads) {
+             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+ 
+@@ -1633,6 +1640,26 @@
+                 continue;
+             }
+ 
++            if (tgt_masked) {
++                // [rag] only the output rows have a hidden state; a prompt chunk without one leaves pending_h as is
++                int32_t n_rows = 0;
++                verify_h[seq_id].resize((size_t) (i_batch_end[seq_id] - i_batch_beg[seq_id] + 1) * n_embd);
++                for (int32_t k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
++                    if (!batch_in.tokens[k].output || batch_in.tokens[k].seq_id != seq_id) {
++                        continue;
++                    }
++                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, k);
++                    GGML_ASSERT(h != nullptr);
++                    std::memcpy(verify_h[seq_id].data() + (size_t) n_rows * n_embd, h, row_bytes);
++                    n_rows++;
++                }
++                verify_h_rows[seq_id] = n_rows;
++                if (n_rows > 0) {
++                    std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
++                }
++                continue;
++            }
++
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+diff -ruN a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp	2026-10-12 16:16:34.391744300 +0000
+@@ -3999,6 +3999,15 @@
+             return tb.matmul(m, n);
+         }
+ #elif defined(__AVX2__)
++        // [rag] BF16 weights times F32 activations: widening BF16 to F32 is exact, so this gives the same
++        // result as F32 weights and skips rounding the activations to BF16 first
++        if (Btype == GGML_TYPE_F32) {
++            tinyBLAS<8, __m256, __m256, ggml_bf16_t, float, float> tb{ params, k,
++                (const ggml_bf16_t *)A, lda,
++                (const float *)B, ldb,
++                (float *)C, ldc};
++            return tb.matmul(m, n);
++        }
+         if (Btype == GGML_TYPE_BF16) {
+             tinyBLAS<8, __m256, __m256, ggml_bf16_t, ggml_bf16_t, float> tb{ params, k,
+                 (const ggml_bf16_t *)A, lda,
+diff -ruN a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/src/llama-context.cpp	2026-10-12 15:04:18.934216500 +0000
+@@ -2050,7 +2050,27 @@
+             if (n_outputs) {
+                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                if (!model.output_token_ids.empty()) {
++                    // [rag] pruned output head: the graph produced logits for the kept tokens only,
++                    //       scatter them into the full-vocabulary buffer and report the rest as -inf
++                    const auto &  ids    = model.output_token_ids;
++                    const int64_t n_keep = (int64_t) ids.size();
++                    GGML_ASSERT((int64_t) ggml_nelements(t_logits) == n_keep*n_outputs);
++
++                    std::vector<float> tmp(n_keep*n_outputs);
++                    ggml_backend_tensor_get(t_logits, tmp.data(), 0, tmp.size()*sizeof(float));
++
++                    std::fill(logits_out, logits_out + (int64_t) n_outputs*n_vocab, -INFINITY);
++                    for (int64_t o = 0; o < n_outputs; o++) {
++                        const float * src = tmp.data() + o*n_keep;
++                        float       * dst = logits_out + o*n_vocab;
++                        for (int64_t k = 0; k < n_keep; k++) {
++                            dst[ids[k]] = src[k];
++                        }
++                    }
++                } else {
++                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                }
+             }
+         }
+ 
+@@ -2229,7 +2249,9 @@
+     const auto n_embd     = hparams.n_embd;
+     const auto n_embd_out = hparams.n_embd_out();
+ 
+-    bool has_logits     = true;
++    // [rag] this model has no vocabulary head, so the graph never produces logits; reserving (and clearing)
++    // n_vocab floats per output token would cost 1 MiB per token for nothing
++    bool has_logits     = model.arch != LLM_ARCH_GEMMA_EMBEDDING2;
+     bool has_embd       = cparams.embeddings;
+     bool has_embd_nextn = cparams.embeddings_nextn;
+ 
+diff -ruN a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/src/llama-graph.cpp	2026-10-12 13:24:47.984721600 +0000
+@@ -3447,6 +3447,40 @@
+     return cur;
+ }
+ 
++// [rag] same KV store as build_attn(llm_graph_input_attn_kv_iswa *, ...) above, without the attention
++void llm_graph_context::build_attn_store(
++        llm_graph_input_attn_kv_iswa * inp,
++        ggml_tensor * k_cur,
++        ggml_tensor * v_cur,
++                int   il) const {
++    GGML_ASSERT(k_cur && v_cur);
++    GGML_ASSERT(!cparams.training);
++
++    const bool is_swa = hparams.is_swa(il);
++
++    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
++    auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
++
++    if (k_rot) {
++        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
++    }
++    if (v_rot) {
++        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
++    }
++
++    ggml_build_forward_expand(gf, k_cur);
++    ggml_build_forward_expand(gf, v_cur);
++
++    const auto * mctx_iswa = inp->mctx;
++    const auto * mctx_cur  = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
++
++    const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
++    const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
++
++    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
++    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
++}
++
+ ggml_tensor * llm_graph_context::build_attn(
+         llm_graph_input_attn_k_iswa * inp,
+         ggml_tensor * wo,
+diff -ruN a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h	2026-10-12 08:53:58.000000000 +0000
++++ b/src/llama-graph.h	2026-10-12 13:24:47.946170000 +0000
+@@ -1336,6 +1336,14 @@
+                   float   kq_scale,
+                     int   il) const;
+ 
++    // [rag] store k_cur/v_cur in the memory without building the attention itself
++    // used when the rows of the ubatch are only needed to fill the KV cache
++    void build_attn_store(
++            llm_graph_input_attn_kv_iswa * inp,
++            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
++            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
++                    int   il) const;
++
+     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
+ 
+     // note: if k_cur is not provided, it will not be stored in the memory
+diff -ruN a/src/llama-model.h b/src/llama-model.h
+--- a/src/llama-model.h	2026-10-12 08:53:58.000000000 +0000
++++ b/src/llama-model.h	2026-10-12 13:57:10.322798400 +0000
+@@ -764,6 +764,10 @@
+     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
+     std::vector<int32_t> target_layer_ids;
+ 
++    // [rag] pruned output head: when not empty, `output` only has these rows of the vocabulary (ascending token ids)
++    //       and the logits of all the other tokens are reported as -inf
++    std::vector<int32_t> output_token_ids;
++
+     std::vector<llama_layer> layers;
+ 
+     //Dense linear projections for SentenceTransformers models like embeddinggemma
+diff -ruN a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+--- a/src/llama-vocab.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/src/llama-vocab.cpp	2026-10-12 16:36:22.017135100 +0000
+@@ -1966,6 +1966,11 @@
+     };
+     std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+ 
++    // [rag] BPE merges keyed by (left token id << 32 | right token id), sorted by key. Used instead of bpe_ranks
++    // when both sides of every merge are tokens: 16 bytes per merge instead of roughly 100 for a pair of strings
++    std::vector<std::pair<uint64_t, int>> bpe_ranks_by_id;
++    int bpe_merges_deferred_keyidx = -1;
++
+     // set of all tokens that cause "end of generation"
+     std::set<llama_token> special_eog_ids;
+ 
+@@ -2233,22 +2238,8 @@
+                     gguf_get_arr_type(ctx, merges_keyidx) != GGUF_TYPE_STRING) {
+                     throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
+                 }
+-                const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
+-                for (int i = 0; i < n_merges; i++) {
+-                    const std::string word = gguf_get_arr_str(ctx, merges_keyidx, i);
+-
+-                    std::string first;
+-                    std::string second;
+-
+-                    const size_t pos = word.find(' ', 1);
+-
+-                    if (pos != std::string::npos) {
+-                        first  = word.substr(0, pos);
+-                        second = word.substr(pos + 1);
+-                    }
+-
+-                    bpe_ranks.emplace(std::make_pair(first, second), i);
+-                }
++                // [rag] the merge table is built after the tokens are loaded, so it can be keyed by token ids
++                bpe_merges_deferred_keyidx = merges_keyidx;
+             }
+ 
+             // default special tokens (to be read from GGUF)
+@@ -2664,6 +2655,56 @@
+     }
+     GGML_ASSERT(id_to_token.size() == token_to_id.size());
+ 
++    // [rag] build the deferred merge table. Both sides of a merge are normally tokens, so the table is keyed by
++    // token ids; if any side is not a token, fall back to the string-keyed table (same behaviour as upstream)
++    if (bpe_merges_deferred_keyidx != -1) {
++        const int n_merges = gguf_get_arr_n(ctx, bpe_merges_deferred_keyidx);
++        bool all_tokens = true;
++        bpe_ranks_by_id.reserve(n_merges);
++        for (int i = 0; i < n_merges; i++) {
++            const std::string word = gguf_get_arr_str(ctx, bpe_merges_deferred_keyidx, i);
++            const size_t pos = word.find(' ', 1);
++            if (pos == std::string::npos) {
++                all_tokens = false;
++                break;
++            }
++            const auto left  = token_to_id.find(word.substr(0, pos));
++            const auto right = token_to_id.find(word.substr(pos + 1));
++            if (left == token_to_id.end() || right == token_to_id.end()) {
++                all_tokens = false;
++                break;
++            }
++            bpe_ranks_by_id.emplace_back(((uint64_t) (uint32_t) left->second << 32) | (uint32_t) right->second, i);
++        }
++        if (all_tokens) {
++            // lowest rank first, so that a repeated pair keeps its first rank like unordered_map::emplace does
++            std::sort(bpe_ranks_by_id.begin(), bpe_ranks_by_id.end());
++            bpe_ranks_by_id.erase(
++                std::unique(bpe_ranks_by_id.begin(), bpe_ranks_by_id.end(),
++                    [] (const std::pair<uint64_t, int> & a, const std::pair<uint64_t, int> & b) { return a.first == b.first; }),
++                bpe_ranks_by_id.end());
++            bpe_ranks_by_id.shrink_to_fit();
++        } else {
++            std::vector<std::pair<uint64_t, int>>().swap(bpe_ranks_by_id);
++            for (int i = 0; i < n_merges; i++) {
++                const std::string word = gguf_get_arr_str(ctx, bpe_merges_deferred_keyidx, i);
++
++                std::string first;
++                std::string second;
++
++                const size_t pos = word.find(' ', 1);
++
++                if (pos != std::string::npos) {
++                    first  = word.substr(0, pos);
++                    second = word.substr(pos + 1);
++                }
++
++                bpe_ranks.emplace(std::make_pair(first, second), i);
++            }
++        }
++        LLAMA_LOG_INFO("%s: bpe merges = %d, keyed by %s\n", __func__, n_merges, all_tokens ? "token ids" : "strings");
++    }
++
+     // hybriddna: the marker suffix kept k-mer ids distinct in token_to_id; erase
+     // it from id_to_token so the k-mers detokenize to the bare DNA sequence. The
+     // k-mers are the block right after <oov>, so only scan from there.
+@@ -4049,7 +4090,7 @@
+ void llama_vocab::impl::print_info() const {
+     LLAMA_LOG_INFO("%s: vocab type            = %s\n",     __func__, type_name().c_str());
+     LLAMA_LOG_INFO("%s: n_vocab               = %u\n",     __func__, vocab.n_tokens());
+-    LLAMA_LOG_INFO("%s: n_merges              = %u\n",     __func__, (uint32_t) bpe_ranks.size());
++    LLAMA_LOG_INFO("%s: n_merges              = %u\n",     __func__, (uint32_t) (bpe_ranks.size() + bpe_ranks_by_id.size()));
+ 
+     // special tokens
+     if (special_bos_id  != LLAMA_TOKEN_NULL)    { LLAMA_LOG_INFO( "%s: BOS token             = %d '%s'\n", __func__, special_bos_id,     id_to_token.at(special_bos_id).text.c_str() );  }
+@@ -4332,6 +4373,22 @@
+     GGML_ASSERT(token_left.find(' ')   == std::string::npos);
+     GGML_ASSERT(token_right.find(' ')  == std::string::npos);
+ 
++    // [rag] id-keyed table: a string that is not a token cannot be part of any merge
++    if (!pimpl->bpe_ranks_by_id.empty()) {
++        const auto left  = pimpl->token_to_id.find(token_left);
++        const auto right = pimpl->token_to_id.find(token_right);
++        if (left == pimpl->token_to_id.end() || right == pimpl->token_to_id.end()) {
++            return -1;
++        }
++        const uint64_t key = ((uint64_t) (uint32_t) left->second << 32) | (uint32_t) right->second;
++        const auto pos = std::lower_bound(pimpl->bpe_ranks_by_id.begin(), pimpl->bpe_ranks_by_id.end(), key,
++            [] (const std::pair<uint64_t, int> & entry, uint64_t k) { return entry.first < k; });
++        if (pos == pimpl->bpe_ranks_by_id.end() || pos->first != key) {
++            return -1;
++        }
++        return pos->second;
++    }
++
+     auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
+     if (it == pimpl->bpe_ranks.end()) {
+         return -1;
+@@ -4341,6 +4398,19 @@
+ }
+ 
+ std::vector<std::string> llama_vocab::get_bpe_merges() const {
++    if (!pimpl->bpe_ranks_by_id.empty()) {
++        // [rag] rebuild the "left right" strings from the id-keyed table
++        int max_rank_by_id = -1;
++        for (const auto & entry : pimpl->bpe_ranks_by_id) {
++            max_rank_by_id = std::max(max_rank_by_id, entry.second);
++        }
++        std::vector<std::string> result_by_id(max_rank_by_id + 1);
++        for (const auto & entry : pimpl->bpe_ranks_by_id) {
++            result_by_id[entry.second] = pimpl->id_to_token[entry.first >> 32].text + " " + pimpl->id_to_token[entry.first & 0xffffffffu].text;
++        }
++        return result_by_id;
++    }
++
+     int max_rank = -1;
+     for (const auto & pair : pimpl->bpe_ranks) {
+         max_rank = std::max(max_rank, pair.second);
+diff -ruN a/src/models/gemma-embedding2.cpp b/src/models/gemma-embedding2.cpp
+--- a/src/models/gemma-embedding2.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/src/models/gemma-embedding2.cpp	2026-10-12 14:37:53.092904200 +0000
+@@ -31,7 +31,8 @@
+         throw std::runtime_error("EmbeddingGemma2 requires n_embd_head_k_swa == n_embd_head_v_swa");
+     }
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    // [rag] the token embedding is only used for row lookups (the output is a separate projection), so it can stay on disk
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_READ_LAZY);
+ 
+     per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_embd_per_layer * n_layer}, 0);
+     per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_embd_per_layer}, 0);
+diff -ruN a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+--- a/src/models/gemma4.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/src/models/gemma4.cpp	2026-10-12 13:57:22.210399300 +0000
+@@ -1,6 +1,8 @@
+ #include "models.h"
+ #include "llama-impl.h"
+ 
++#include <cstdlib>
++
+ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
+     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+@@ -32,6 +34,25 @@
+         case 60: type = LLM_TYPE_31B; break;
+         default: type = LLM_TYPE_UNKNOWN;
+     }
++
++    // [rag] optional pruned output head (see llama_model::output_token_ids)
++    {
++        const int kid = gguf_find_key(ml.metadata, "rag.output_token_ids");
++        if (kid >= 0) {
++            if (gguf_get_kv_type(ml.metadata, kid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(ml.metadata, kid) != GGUF_TYPE_INT32) {
++                throw std::runtime_error("rag.output_token_ids must be an array of int32");
++            }
++            const size_t    n    = gguf_get_arr_n(ml.metadata, kid);
++            const int32_t * data = (const int32_t *) gguf_get_arr_data(ml.metadata, kid);
++            output_token_ids.assign(data, data + n);
++            for (size_t i = 0; i < n; i++) {
++                if (data[i] < 0 || (i > 0 && data[i] <= data[i - 1])) {
++                    throw std::runtime_error("rag.output_token_ids must be ascending token ids");
++                }
++            }
++            LLAMA_LOG_INFO("%s: using a pruned output head with %zu tokens\n", __func__, n);
++        }
++    }
+ }
+ 
+ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
+@@ -47,13 +68,23 @@
+         throw std::runtime_error("Gemma 4 requires n_embd_head_k_swa == n_embd_head_v_swa");
+     }
+ 
+-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+-    // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
+-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+-    }
++    if (!output_token_ids.empty()) {
++        // [rag] pruned output head: a separate tensor with the kept rows only.
++        //       the input embedding is then only used for row lookups and can stay on disk
++        if (output_token_ids.back() >= n_vocab) {
++            throw std::runtime_error("rag.output_token_ids has a token id outside of the vocabulary");
++        }
++        output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, (int64_t) output_token_ids.size()}, 0);
++        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_READ_LAZY);
++    } else {
++        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++        // if output is NULL, init from the input tok embed
++        if (output == NULL) {
++            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++        }
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    }
+ 
+     if (n_embd_per_layer > 0) {
+         per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),    {n_embd_per_layer * n_layer, n_vocab}, TENSOR_READ_LAZY);
+@@ -189,6 +220,28 @@
+         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
+     }
+ 
++    // [rag] early output crop
++    // the layers from n_layer_kv_from_start on reuse the KV cache of earlier layers and never write to it,
++    // so the rows of the ubatch that are not output do not have to go through them. the last KV layer only
++    // has to produce K/V for those rows. this implements the "strip unused token" TODO below.
++    const int il_kv_last = hparams.n_layer_kv_from_start - 1;
++
++    bool early_crop = il_kv_last >= 0 && il_kv_last < n_layer - 1 &&
++                      crop_before_nextn(inp_out_ids)              &&
++                      (int64_t) n_outputs < n_tokens              &&
++                      !cparams.training                           &&
++                      inp_attn->get_kq_mask()->ne[3] == 1         &&
++                      inp_attn->get_kq_mask_swa()->ne[3] == 1     &&
++                      getenv("RAG_NO_EARLY_CROP") == nullptr;
++    for (const bool v : cparams.embeddings_layer_inp) {
++        // the layer inputs are extracted for all the tokens
++        early_crop = early_crop && !v;
++    }
++
++    int64_t       n_tokens_cur = n_tokens;
++    ggml_tensor * inp_pos_cur  = inp_pos;
++    bool          cropped      = false;
++
+     for (int il = 0; il < n_layer; ++il) {
+         const int64_t n_embd_head = hparams.n_embd_head_k(il);
+         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
+@@ -200,6 +253,8 @@
+         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+         const int   n_rot_l      = hparams.n_rot(il);
+ 
++        const bool crop_here = early_crop && il == il_kv_last;
++
+         res->t_layer_inp[il] = inpL;
+ 
+         // norm
+@@ -212,6 +267,64 @@
+             freq_factors = model.layers[il].rope_freqs;
+         }
+ 
++        // [rag] K/V for all the rows; only used when crop_here (the regular path computes them further down)
++        ggml_tensor * Kcur_all = nullptr;
++        ggml_tensor * Vcur_all = nullptr;
++        if (crop_here) {
++            GGML_ASSERT(hparams.has_kv(il));
++            GGML_ASSERT(model.layers[il].wqkv == nullptr && "early crop does not support fused QKV");
++
++            Kcur_all = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
++            Vcur_all = model.layers[il].wv
++                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
++                       : Kcur_all;
++            cb(Kcur_all, "Kcur", il);
++            cb(Vcur_all, "Vcur", il);
++
++            Kcur_all = ggml_reshape_3d(ctx0, Kcur_all, n_embd_head, n_head_kv, n_tokens);
++            Vcur_all = ggml_reshape_3d(ctx0, Vcur_all, n_embd_head, n_head_kv, n_tokens);
++
++            Kcur_all = build_norm(Kcur_all, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
++            Vcur_all = ggml_rms_norm(ctx0, Vcur_all, hparams.f_norm_rms_eps);
++
++            Kcur_all = ggml_rope_ext(ctx0, Kcur_all, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++                                     ext_factor, attn_factor, beta_fast, beta_slow);
++
++            if (n_outputs == 0) {
++                // nothing is output from this ubatch: fill the KV cache and stop here
++                build_attn_store(inp_attn, Kcur_all, Vcur_all, il);
++
++                inpL    = ggml_get_rows(ctx0, inpL, inp_out_ids);
++                cropped = true;
++                break;
++            }
++
++            // from here on, only the output rows are computed
++            cur  = ggml_get_rows(ctx0, cur,  inp_out_ids);
++            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
++
++            inp_pos_cur = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens), inp_out_ids);
++            inp_pos_cur = ggml_reshape_1d(ctx0, inp_pos_cur, n_outputs);
++
++            const auto crop_mask = [&](ggml_tensor * mask) {
++                // [n_kv, n_tokens, 1, 1] -> [n_kv, n_outputs, 1, 1]
++                const ggml_type type = mask->type;
++                ggml_tensor * m = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, mask, mask->ne[0], mask->ne[1]), inp_out_ids);
++                if (type != GGML_TYPE_F32) {
++                    // ggml_get_rows returns F32, flash attention needs the F16 mask back
++                    m = ggml_cast(ctx0, m, type);
++                }
++                return ggml_reshape_4d(ctx0, m, m->ne[0], m->ne[1], 1, 1);
++            };
++
++            // note: set_input()/can_reuse() work on self_kq_mask*, the *_cnv tensors are what build_attn() reads
++            inp_attn->self_kq_mask_cnv     = crop_mask(inp_attn->self_kq_mask_cnv);
++            inp_attn->self_kq_mask_swa_cnv = crop_mask(inp_attn->self_kq_mask_swa_cnv);
++
++            n_tokens_cur = n_outputs;
++            cropped      = true;
++        }
++
+         // Q projection (shared for both non-KV and KV layers)
+         // this is to mirror Gemma4Attention in pytorch code
+         ggml_tensor * qkv_fused = nullptr;
+@@ -220,25 +333,30 @@
+             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+             cb(qkv_fused, "wqkv", il);
+             const int64_t q_dim = n_embd_head * n_head;
+-            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
++            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens_cur, qkv_fused->nb[1], 0));
+         } else {
+             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+         }
+         {
+             cb(Qcur, "Qcur", il);
+ 
+-            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
++            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens_cur);
+ 
+             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
+-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos_cur, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                                  ext_factor, attn_factor, beta_fast, beta_slow);
+             cb(Qcur, "Qcur_pos", il);
+         }
+ 
+         // self-attention
+-        if (hparams.has_kv(il)) {
++        if (crop_here) {
++            // [rag] K/V of all the rows go to the KV cache, the attention is computed for the output rows only
++            cur = build_attn(inp_attn, model.layers[il].wo,
++                    nullptr, model.layers[il].wo_s, Qcur, Kcur_all, Vcur_all, nullptr, nullptr, nullptr,
++                    hparams.f_attention_scale, il);
++        } else if (hparams.has_kv(il)) {
+             ggml_tensor * Kcur;
+             ggml_tensor * Vcur;
+             if (qkv_fused) {
+@@ -282,8 +400,9 @@
+         }
+ 
+         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
++        //                [rag] done above when early_crop is set
+         // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
+-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids) && !cropped) {
+             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+         }
+@@ -383,7 +502,7 @@
+             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
+ 
+             // TODO @ngxson : improve this
+-            if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++            if ((il == n_layer - 1 && crop_before_nextn(inp_out_ids)) || cropped) {
+                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
+             }
+ 
+diff -ruN a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+--- a/tools/CMakeLists.txt	2026-10-12 08:53:58.000000000 +0000
++++ b/tools/CMakeLists.txt	2026-10-12 13:30:02.058693700 +0000
+@@ -42,4 +42,5 @@
+         add_subdirectory(tuning)
+     endif()
+     add_subdirectory(results)
++    add_subdirectory(rag-check) # [rag]
+ endif()
+diff -ruN a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+--- a/tools/mtmd/clip.cpp	2026-10-12 08:53:58.000000000 +0000
++++ b/tools/mtmd/clip.cpp	2026-10-12 14:46:46.466254200 +0000
+@@ -1703,6 +1703,9 @@
+                         hparams.rope_theta = 100.0f;
+                         hparams.n_merge = 3; // pooling_kernel_size
+                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
++                        // [rag] the reference processor (Gemma4ImageProcessor) resizes straight to the target size,
++                        // it does not letterbox; padding adds black bars the model was never trained on
++                        hparams.image_resize_pad = PAD_NONE;
+                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                         if (model.proj_type == PROJECTOR_TYPE_GEMMA4UV) {
+                             // for "unified" variant, we directly use a bigger patch size, because the "token merging" is done directly on conv layer
+diff -ruN a/tools/rag-check/CMakeLists.txt b/tools/rag-check/CMakeLists.txt
+--- a/tools/rag-check/CMakeLists.txt	1970-01-01 00:00:00.000000000 +0000
++++ b/tools/rag-check/CMakeLists.txt	2026-10-12 14:00:52.761745900 +0000
+@@ -0,0 +1,5 @@
++foreach(TARGET rag-check rag-headcost rag-headcheck)
++    add_executable(${TARGET} ${TARGET}.cpp)
++    target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++    target_compile_features(${TARGET} PRIVATE cxx_std_17)
++endforeach()
+diff -ruN a/tools/rag-check/rag-check.cpp b/tools/rag-check/rag-check.cpp
+--- a/tools/rag-check/rag-check.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tools/rag-check/rag-check.cpp	2026-10-12 17:14:12.962984700 +0000
+@@ -0,0 +1,286 @@
++// [rag] rag-check: verifies that the Gemma 4 early output crop does not change the results.
++//
++// The same prompts are processed twice, in two contexts created from the same model:
++//   - reference: RAG_NO_EARLY_CROP=1 (original graph)
++//   - test     : early crop enabled
++// For each case the logits of the requested prompt positions and of n_gen teacher-forced
++// generation steps are compared (the generation steps read the KV cache written by the prefill).
++//
++// usage: rag-check <model.gguf> [n_threads] [n_gen]
++
++#include "llama.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++struct test_case {
++    int              n_prompt;   // number of prompt tokens
++    std::vector<int> extra_out;  // extra output positions in the prompt (the last token is always output)
++};
++
++struct run_result {
++    std::vector<std::vector<float>> logits; // prompt outputs (in position order), then generation steps
++    std::vector<llama_token>        gen;
++    double                          t_prefill_ms = 0.0;
++};
++
++static const char * TEXT =
++    "The bank's internal audit policy requires that every loan application above five million dollars be "
++    "reviewed by two independent credit officers before approval. \xE6\x9C\xAC\xE8\xA1\x8C\xE5\x85\xA7\xE9\x83\xA8"
++    "\xE7\xA8\xBD\xE6\xA0\xB8\xE8\xA6\x8F\xE5\xAE\x9A\xEF\xBC\x8C\xE8\xB6\x85\xE9\x81\x8E\xE4\xBA\x94\xE7\x99\xBE"
++    "\xE8\x90\xAC\xE5\x85\x83\xE7\x9A\x84\xE8\xB2\xB8\xE6\xAC\xBE\xE7\x94\xB3\xE8\xAB\x8B\xE9\xA0\x88\xE7\xB6\x93"
++    "\xE5\x85\xA9\xE4\xBD\x8D\xE6\x8E\x88\xE4\xBF\xA1\xE4\xBA\xBA\xE5\x93\xA1\xE5\x88\x86\xE5\x88\xA5\xE5\xAF\xA9"
++    "\xE6\x9F\xA5\xE3\x80\x82 Patients admitted to the cardiology ward must have their medication list reconciled "
++    "within twenty-four hours, and any discrepancy is reported to the attending physician. "
++    "\xE7\x97\x85\xE4\xBA\xBA\xE5\x85\xA5\xE4\xBD\x8F\xE5\xBF\x83\xE8\x87\x9F\xE5\x85\xA7\xE7\xA7\x91\xE7\x97\x85"
++    "\xE6\x88\xBF\xE5\xBE\x8C\xEF\xBC\x8C\xE9\xA0\x88\xE6\x96\xBC\xE4\xBA\x8C\xE5\x8D\x81\xE5\x9B\x9B\xE5\xB0\x8F"
++    "\xE6\x99\x82\xE5\x85\xA7\xE5\xAE\x8C\xE6\x88\x90\xE7\x94\xA8\xE8\x97\xA5\xE6\xA0\xB8\xE5\xB0\x8D\xE3\x80\x82 "
++    "Section 4.2 describes the retention period for transaction records: seven years for corporate accounts and "
++    "five years for personal accounts, counted from the date the account is closed. ";
++
++static std::vector<llama_token> make_tokens(const llama_vocab * vocab, int n) {
++    std::string text;
++    int i = 0;
++    while ((int) text.size() < n * 8) {
++        text += TEXT;
++        text += "(" + std::to_string(++i) + ") ";
++    }
++    std::vector<llama_token> tokens(text.size() + 16);
++    const int n_tok = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), (int32_t) tokens.size(), true, false);
++    if (n_tok < n) {
++        fprintf(stderr, "not enough tokens: %d < %d\n", n_tok, n);
++        exit(1);
++    }
++    tokens.resize(n);
++    return tokens;
++}
++
++static run_result run(llama_context * ctx, const llama_vocab * vocab, const std::vector<llama_token> & prompt,
++                      const std::vector<int> & extra_out, int n_gen, const std::vector<llama_token> * forced) {
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    const int n_batch = (int) llama_n_batch(ctx);
++
++    run_result res;
++
++    llama_memory_clear(llama_get_memory(ctx), true);
++
++    const int n_prompt = (int) prompt.size();
++
++    const auto t0 = std::chrono::steady_clock::now();
++
++    for (int i0 = 0; i0 < n_prompt; i0 += n_batch) {
++        const int n = std::min(n_batch, n_prompt - i0);
++
++        llama_batch batch = llama_batch_init(n, 0, 1);
++        std::vector<int> out_idx;
++        for (int i = 0; i < n; i++) {
++            const int pos = i0 + i;
++            const bool out = pos == n_prompt - 1 || std::find(extra_out.begin(), extra_out.end(), pos) != extra_out.end();
++            batch.token   [i]    = prompt[pos];
++            batch.pos     [i]    = pos;
++            batch.n_seq_id[i]    = 1;
++            batch.seq_id  [i][0] = 0;
++            batch.logits  [i]    = out;
++            if (out) {
++                out_idx.push_back(i);
++            }
++        }
++        batch.n_tokens = n;
++
++        if (llama_decode(ctx, batch) != 0) {
++            fprintf(stderr, "llama_decode failed\n");
++            exit(1);
++        }
++        for (const int i : out_idx) {
++            const float * l = llama_get_logits_ith(ctx, i);
++            res.logits.emplace_back(l, l + n_vocab);
++        }
++        llama_batch_free(batch);
++    }
++
++    res.t_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++
++    for (int g = 0; g < n_gen; g++) {
++        llama_token tok;
++        if (forced) {
++            tok = (*forced)[g];
++        } else {
++            const auto & l = res.logits.back();
++            tok = (llama_token) (std::max_element(l.begin(), l.end()) - l.begin());
++        }
++        res.gen.push_back(tok);
++
++        llama_batch batch = llama_batch_init(1, 0, 1);
++        batch.token   [0]    = tok;
++        batch.pos     [0]    = n_prompt + g;
++        batch.n_seq_id[0]    = 1;
++        batch.seq_id  [0][0] = 0;
++        batch.logits  [0]    = true;
++        batch.n_tokens       = 1;
++        if (llama_decode(ctx, batch) != 0) {
++            fprintf(stderr, "llama_decode failed\n");
++            exit(1);
++        }
++        const float * l = llama_get_logits_ith(ctx, 0);
++        res.logits.emplace_back(l, l + n_vocab);
++        llama_batch_free(batch);
++    }
++
++    return res;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s <model.gguf> [n_threads] [n_gen]\n", argv[0]);
++        return 1;
++    }
++    const int n_threads = argc > 2 ? atoi(argv[2]) : 6;
++    const int n_gen     = argc > 3 ? atoi(argv[3]) : 8;
++
++    llama_backend_init();
++
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = 0;
++    mparams.load_mode    = LLAMA_LOAD_MODE_NONE;
++    mparams.lazy_mode    = LLAMA_LAZY_MODE_ON;
++
++    llama_model * model = llama_model_load_from_file(argv[1], mparams);
++    if (!model) {
++        fprintf(stderr, "failed to load model\n");
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    const std::vector<test_case> cases = {
++        {    1, {}              },
++        {   10, {}              },
++        {   10, { 0, 3 }        },
++        {  100, { 50 }          },
++        {  512, {}              },
++        {  513, {}              },
++        {  600, {}              }, // ubatches: 512 (no output) + 88 (1 output)
++        {  600, { 5, 511, 512 } },
++        { 1500, {}              }, // longer than the sliding window
++        { 2500, { 2047, 2048 }  }, // more than one batch
++    };
++
++    std::vector<std::vector<llama_token>> prompts;
++    for (const auto & c : cases) {
++        prompts.push_back(make_tokens(vocab, c.n_prompt));
++    }
++
++    // mode 0: reference (early crop disabled)
++    // mode 1: early crop enabled
++    // mode 2: reference with one thread less  (noise floor: same graph, different work split)
++    // mode 3: reference with n_ubatch = 128   (noise floor: same math, different batch shapes)
++    const int n_modes = 4;
++    std::vector<run_result> results[4];
++
++    for (int mode = 0; mode < n_modes; mode++) {
++        if (mode != 1) {
++            setenv("RAG_NO_EARLY_CROP", "1", 1);
++        } else {
++            unsetenv("RAG_NO_EARLY_CROP");
++        }
++
++        const int n_threads_cur = mode == 2 ? std::max(1, n_threads - 1) : n_threads;
++
++        llama_context_params cparams = llama_context_default_params();
++        cparams.n_ctx           = 4096;
++        cparams.n_batch         = 2048;
++        cparams.n_ubatch        = mode == 3 ? 128 : 512;
++        cparams.n_threads       = n_threads_cur;
++        cparams.n_threads_batch = n_threads_cur;
++        cparams.no_perf         = true;
++
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (!ctx) {
++            fprintf(stderr, "failed to create context\n");
++            return 1;
++        }
++
++        // warmup
++        run(ctx, vocab, prompts[1], {}, 1, nullptr);
++
++        for (size_t i = 0; i < cases.size(); i++) {
++            const std::vector<llama_token> * forced = mode != 0 ? &results[0][i].gen : nullptr;
++            results[mode].push_back(run(ctx, vocab, prompts[i], cases[i].extra_out, n_gen, forced));
++        }
++
++        llama_free(ctx);
++    }
++
++    struct diff {
++        double max_d = 0.0;
++        double nmse  = 0.0;
++        int    n_argmax_diff = 0;
++    };
++
++    const auto compare = [](const run_result & a, const run_result & b) {
++        diff d;
++        double se = 0.0, s0 = 0.0;
++        GGML_ASSERT(a.logits.size() == b.logits.size());
++        for (size_t k = 0; k < a.logits.size(); k++) {
++            const auto & la = a.logits[k];
++            const auto & lb = b.logits[k];
++            for (size_t j = 0; j < la.size(); j++) {
++                // tokens removed by a pruned output head are -inf in both runs; anything else non-finite is an error
++                if (!std::isfinite(la[j]) || !std::isfinite(lb[j])) {
++                    if (la[j] != lb[j]) {
++                        d.max_d = INFINITY;
++                        d.n_argmax_diff++;
++                    }
++                    continue;
++                }
++                const double x = (double) la[j] - (double) lb[j];
++                d.max_d = std::max(d.max_d, std::fabs(x));
++                se += x * x;
++                s0 += (double) la[j] * (double) la[j];
++            }
++            if (std::max_element(la.begin(), la.end()) - la.begin() != std::max_element(lb.begin(), lb.end()) - lb.begin()) {
++                d.n_argmax_diff++;
++            }
++        }
++        d.nmse = se / s0;
++        return d;
++    };
++
++    bool ok = true;
++
++    // the early crop passes when it agrees with the reference at least as well as the reference agrees with itself
++    // (quantized mat-muls are not bit-reproducible across batch shapes / thread counts)
++    printf("\n%8s %5s | %9s %9s %7s | %-27s | %-18s | %-18s\n", "n_prompt", "n_out", "ref ms", "crop ms", "speedup",
++           "crop vs ref: max|d| NMSE am", "threads-1: NMSE am", "ubatch128: NMSE am");
++    double nmse_crop_max = 0.0, nmse_noise_max = 0.0;
++    for (size_t i = 0; i < cases.size(); i++) {
++        const diff dc = compare(results[0][i], results[1][i]);
++        const diff dt = compare(results[0][i], results[2][i]);
++        const diff du = compare(results[0][i], results[3][i]);
++
++        nmse_crop_max  = std::max(nmse_crop_max,  dc.nmse);
++        nmse_noise_max = std::max(nmse_noise_max, std::max(dt.nmse, du.nmse));
++
++        ok = ok && dc.n_argmax_diff == 0;
++
++        printf("%8d %5zu | %9.1f %9.1f %6.2fx | %9.2e %9.2e %-6s | %9.2e %-6s | %9.2e %-6s\n",
++               cases[i].n_prompt, cases[i].extra_out.size() + 1,
++               results[0][i].t_prefill_ms, results[1][i].t_prefill_ms, results[0][i].t_prefill_ms / results[1][i].t_prefill_ms,
++               dc.max_d, dc.nmse, dc.n_argmax_diff == 0 ? "same" : "DIFF",
++               dt.nmse, dt.n_argmax_diff == 0 ? "same" : "DIFF",
++               du.nmse, du.n_argmax_diff == 0 ? "same" : "DIFF");
++    }
++
++    printf("\nmax NMSE: crop vs ref = %.2e, reference noise floor = %.2e\n", nmse_crop_max, nmse_noise_max);
++    ok = ok && nmse_crop_max <= std::max(4.0 * nmse_noise_max, 1e-6);
++
++    printf("\n%s\n", ok ? "RESULT: PASS" : "RESULT: FAIL");
++
++    llama_model_free(model);
++
++    return ok ? 0 : 1;
++}
+diff -ruN a/tools/rag-check/rag-headcheck.cpp b/tools/rag-check/rag-headcheck.cpp
+--- a/tools/rag-check/rag-headcheck.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tools/rag-check/rag-headcheck.cpp	2026-10-12 14:01:01.653177400 +0000
+@@ -0,0 +1,188 @@
++// [rag] rag-headcheck: verifies a GGUF with a pruned output head against the original file.
++//
++// Both files are run on the same prompt and the same (teacher-forced) continuation. For every step:
++//   - the logits of the kept tokens must match the original (same quantized rows, so only float noise)
++//   - the logits of the removed tokens must be -inf
++// It also reports how often the original model's top token was a removed one, and the decode speed.
++//
++// usage: rag-headcheck <original.gguf> <pruned.gguf> [n_threads] [n_gen]
++
++#include "llama.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++struct run_result {
++    std::vector<std::vector<float>> logits;
++    std::vector<llama_token>        gen;
++    double                          ms_per_token = 0.0;
++};
++
++static const char * PROMPT =
++    "<bos><|turn>user\n"
++    "\xE8\xAB\x8B\xE7\x94\xA8\xE7\xB9\x81\xE9\xAB\x94\xE4\xB8\xAD\xE6\x96\x87\xE8\xAA\xAA\xE6\x98\x8E\xE9\x8A\x80"
++    "\xE8\xA1\x8C\xE7\x82\xBA\xE4\xBB\x80\xE9\xBA\xBC\xE8\xA6\x81\xE4\xBF\x9D\xE5\xAD\x98\xE4\xBA\xA4\xE6\x98\x93"
++    "\xE7\xB4\x80\xE9\x8C\x84\xEF\xBC\x8C\xE4\xB8\xA6\xE8\x88\x89\xE4\xB8\x80\xE5\x80\x8B\xE8\x8B\xB1\xE6\x96\x87"
++    "\xE8\xA1\x93\xE8\xAA\x9E\xE3\x80\x82<turn|>\n<|turn>model\n";
++
++static run_result run(const char * path, int n_threads, int n_gen, const std::vector<llama_token> * forced) {
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = 0;
++    mparams.load_mode    = LLAMA_LOAD_MODE_NONE;
++    mparams.lazy_mode    = LLAMA_LAZY_MODE_ON;
++
++    llama_model * model = llama_model_load_from_file(path, mparams);
++    if (!model) {
++        fprintf(stderr, "failed to load %s\n", path);
++        exit(1);
++    }
++    const llama_vocab * vocab   = llama_model_get_vocab(model);
++    const int           n_vocab = llama_vocab_n_tokens(vocab);
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx           = 2048;
++    cparams.n_batch         = 512;
++    cparams.n_ubatch        = 512;
++    cparams.n_threads       = n_threads;
++    cparams.n_threads_batch = n_threads;
++    cparams.no_perf         = true;
++
++    llama_context * ctx = llama_init_from_model(model, cparams);
++
++    std::vector<llama_token> prompt(512);
++    const int n_prompt = llama_tokenize(vocab, PROMPT, (int32_t) strlen(PROMPT), prompt.data(), (int32_t) prompt.size(), false, true);
++    prompt.resize(n_prompt);
++
++    run_result res;
++
++    llama_batch batch = llama_batch_init(n_prompt, 0, 1);
++    for (int i = 0; i < n_prompt; i++) {
++        batch.token   [i]    = prompt[i];
++        batch.pos     [i]    = i;
++        batch.n_seq_id[i]    = 1;
++        batch.seq_id  [i][0] = 0;
++        batch.logits  [i]    = i == n_prompt - 1;
++    }
++    batch.n_tokens = n_prompt;
++    if (llama_decode(ctx, batch) != 0) {
++        exit(1);
++    }
++    {
++        const float * l = llama_get_logits_ith(ctx, n_prompt - 1);
++        res.logits.emplace_back(l, l + n_vocab);
++    }
++    llama_batch_free(batch);
++
++    const auto t0 = std::chrono::steady_clock::now();
++    for (int g = 0; g < n_gen; g++) {
++        llama_token tok;
++        if (forced) {
++            tok = (*forced)[g];
++        } else {
++            const auto & l = res.logits.back();
++            tok = (llama_token) (std::max_element(l.begin(), l.end()) - l.begin());
++        }
++        res.gen.push_back(tok);
++
++        llama_batch b = llama_batch_init(1, 0, 1);
++        b.token   [0]    = tok;
++        b.pos     [0]    = n_prompt + g;
++        b.n_seq_id[0]    = 1;
++        b.seq_id  [0][0] = 0;
++        b.logits  [0]    = true;
++        b.n_tokens       = 1;
++        if (llama_decode(ctx, b) != 0) {
++            exit(1);
++        }
++        const float * l = llama_get_logits_ith(ctx, 0);
++        res.logits.emplace_back(l, l + n_vocab);
++        llama_batch_free(b);
++    }
++    res.ms_per_token = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / n_gen;
++
++    if (!forced) {
++        std::string text;
++        for (const llama_token t : res.gen) {
++            char buf[64];
++            const int n = llama_token_to_piece(vocab, t, buf, sizeof(buf), 0, false);
++            if (n > 0) {
++                text.append(buf, n);
++            }
++        }
++        printf("\n--- greedy output of the original file ---\n%s\n---\n", text.c_str());
++    }
++
++    llama_free(ctx);
++    llama_model_free(model);
++    return res;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s <original.gguf> <pruned.gguf> [n_threads] [n_gen]\n", argv[0]);
++        return 1;
++    }
++    const int n_threads = argc > 3 ? atoi(argv[3]) : 6;
++    const int n_gen     = argc > 4 ? atoi(argv[4]) : 96;
++
++    // keep the comparison independent of the other patch
++    setenv("RAG_NO_EARLY_CROP", "1", 1);
++
++    llama_backend_init();
++
++    const run_result a = run(argv[1], n_threads, n_gen, nullptr);
++    const run_result b = run(argv[2], n_threads, n_gen, &a.gen);
++
++    size_t n_kept = 0, n_removed = 0;
++    for (const float v : b.logits[0]) {
++        if (std::isinf(v)) {
++            n_removed++;
++        } else {
++            n_kept++;
++        }
++    }
++
++    double max_d = 0.0, se = 0.0, s0 = 0.0;
++    int n_top_removed = 0, n_top_diff = 0;
++    bool ok = true;
++    for (size_t k = 0; k < a.logits.size(); k++) {
++        const auto & la = a.logits[k];
++        const auto & lb = b.logits[k];
++        const size_t top_a = std::max_element(la.begin(), la.end()) - la.begin();
++        const size_t top_b = std::max_element(lb.begin(), lb.end()) - lb.begin();
++        if (std::isinf(lb[top_a])) {
++            n_top_removed++;
++        } else if (top_a != top_b) {
++            n_top_diff++;
++        }
++        for (size_t j = 0; j < la.size(); j++) {
++            if (std::isinf(lb[j])) {
++                ok = ok && lb[j] < 0 && std::isinf(b.logits[0][j]); // the same tokens are removed at every step
++                continue;
++            }
++            const double d = (double) la[j] - (double) lb[j];
++            max_d = std::max(max_d, std::fabs(d));
++            se += d * d;
++            s0 += (double) la[j] * (double) la[j];
++        }
++    }
++    const double nmse = se / s0;
++
++    printf("\nvocab: %zu kept, %zu removed (%.1f%% kept)\n", n_kept, n_removed, 100.0 * n_kept / (n_kept + n_removed));
++    printf("steps compared                       : %zu\n", a.logits.size());
++    printf("kept-token logits, max |d| / NMSE    : %.2e / %.2e\n", max_d, nmse);
++    printf("top token differs (both kept)        : %d\n", n_top_diff);
++    printf("original top token was a removed one : %d\n", n_top_removed);
++    printf("decode: original %.2f ms/token (%.1f t/s), pruned %.2f ms/token (%.1f t/s), %.2fx\n",
++           a.ms_per_token, 1000.0 / a.ms_per_token, b.ms_per_token, 1000.0 / b.ms_per_token, a.ms_per_token / b.ms_per_token);
++
++    ok = ok && nmse < 1e-3 && n_top_diff == 0;
++    printf("\n%s\n", ok ? "RESULT: PASS" : "RESULT: FAIL");
++    return ok ? 0 : 1;
++}
+diff -ruN a/tools/rag-check/rag-headcost.cpp b/tools/rag-check/rag-headcost.cpp
+--- a/tools/rag-check/rag-headcost.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tools/rag-check/rag-headcost.cpp	2026-10-12 13:51:36.860141100 +0000
+@@ -0,0 +1,123 @@
++// [rag] rag-headcost: measures how much of the per-token decode time is spent in the output head (lm_head).
++//
++// Tokens are decoded one at a time, once with logits requested and once without. With RAG_NO_EARLY_CROP=1
++// all the layers still run when no logits are requested (the rows are dropped at the last layer), so the
++// difference between the two is the cost of the output head (plus the tail of the last layer).
++//
++// usage: rag-headcost <model.gguf> [n_threads] [n_tokens]
++
++#include "llama.h"
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++static double decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, int n_ctx_fill, bool logits) {
++    llama_memory_clear(llama_get_memory(ctx), true);
++
++    // fill some context first so that the attention has something to look at
++    {
++        llama_batch batch = llama_batch_init(n_ctx_fill, 0, 1);
++        for (int i = 0; i < n_ctx_fill; i++) {
++            batch.token   [i]    = tokens[i];
++            batch.pos     [i]    = i;
++            batch.n_seq_id[i]    = 1;
++            batch.seq_id  [i][0] = 0;
++            batch.logits  [i]    = false;
++        }
++        batch.n_tokens = n_ctx_fill;
++        if (llama_decode(ctx, batch) != 0) {
++            fprintf(stderr, "llama_decode failed\n");
++            exit(1);
++        }
++        llama_batch_free(batch);
++    }
++
++    const int n = (int) tokens.size() - n_ctx_fill;
++
++    const auto t0 = std::chrono::steady_clock::now();
++    for (int i = 0; i < n; i++) {
++        llama_batch batch = llama_batch_init(1, 0, 1);
++        batch.token   [0]    = tokens[n_ctx_fill + i];
++        batch.pos     [0]    = n_ctx_fill + i;
++        batch.n_seq_id[0]    = 1;
++        batch.seq_id  [0][0] = 0;
++        batch.logits  [0]    = logits;
++        batch.n_tokens       = 1;
++        if (llama_decode(ctx, batch) != 0) {
++            fprintf(stderr, "llama_decode failed\n");
++            exit(1);
++        }
++        llama_batch_free(batch);
++    }
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / n;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s <model.gguf> [n_threads] [n_tokens]\n", argv[0]);
++        return 1;
++    }
++    const int n_threads = argc > 2 ? atoi(argv[2]) : 6;
++    const int n_tokens  = argc > 3 ? atoi(argv[3]) : 64;
++    const int n_fill    = 256;
++
++    setenv("RAG_NO_EARLY_CROP", "1", 1);
++
++    llama_backend_init();
++
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = 0;
++    mparams.load_mode    = LLAMA_LOAD_MODE_NONE;
++    mparams.lazy_mode    = LLAMA_LAZY_MODE_ON;
++
++    llama_model * model = llama_model_load_from_file(argv[1], mparams);
++    if (!model) {
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    std::string text;
++    for (int i = 0; i < 200; i++) {
++        text += "The retention period for transaction records is seven years for corporate accounts. ";
++    }
++    std::vector<llama_token> tokens(text.size());
++    const int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), (int32_t) tokens.size(), true, false);
++    if (n < n_fill + n_tokens) {
++        return 1;
++    }
++    tokens.resize(n_fill + n_tokens);
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx           = 2048;
++    cparams.n_batch         = 512;
++    cparams.n_ubatch        = 512;
++    cparams.n_threads       = n_threads;
++    cparams.n_threads_batch = n_threads;
++    cparams.no_perf         = true;
++
++    llama_context * ctx = llama_init_from_model(model, cparams);
++    if (!ctx) {
++        return 1;
++    }
++
++    decode_tokens(ctx, tokens, n_fill, true); // warmup
++
++    double ms_with = 0.0, ms_without = 0.0;
++    const int n_rep = 3;
++    for (int r = 0; r < n_rep; r++) {
++        ms_with    += decode_tokens(ctx, tokens, n_fill, true)  / n_rep;
++        ms_without += decode_tokens(ctx, tokens, n_fill, false) / n_rep;
++    }
++
++    printf("\nthreads = %d\n", n_threads);
++    printf("per token, with logits   : %7.2f ms (%.1f t/s)\n", ms_with,    1000.0 / ms_with);
++    printf("per token, without logits: %7.2f ms (%.1f t/s)\n", ms_without, 1000.0 / ms_without);
++    printf("output head              : %7.2f ms = %.1f%% of the per-token time\n", ms_with - ms_without, 100.0 * (ms_with - ms_without) / ms_with);
++
++    llama_free(ctx);
++    llama_model_free(model);
++    return 0;
++}

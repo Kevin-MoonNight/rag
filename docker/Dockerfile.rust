@@ -1,0 +1,23 @@
+# Rust 開發用的映像檔：在 rag-dev（已有 MinGW 交叉編譯器）上加 Rust 工具鏈與 Windows 目標。
+# 建立方式：docker build -t rag-rust -f docker/Dockerfile.rust docker
+# 執行時把 CARGO_HOME 指到 /rag/work/cargo-home（套件快取留在開發目錄），編譯的中間檔放容器內的 /build。
+FROM rag-dev
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang libclang-dev lld protobuf-compiler libssl-dev nasm \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && CARGO_HOME=/opt/cargo sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable --no-modify-path \
+    && rm /tmp/rustup-init.sh \
+    && /opt/cargo/bin/rustup target add x86_64-pc-windows-gnu \
+    && /opt/cargo/bin/rustup component add clippy rustfmt \
+    && chmod -R a+rX /opt/rustup /opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH \
+    CARGO_HOME=/rag/work/cargo-home \
+    CARGO_TARGET_DIR=/build/target \
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+
+WORKDIR /rag

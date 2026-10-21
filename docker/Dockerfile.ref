@@ -1,0 +1,13 @@
+# 對照用的映像檔：用 Google 官方實作（sentence-transformers / transformers，CPU 版 PyTorch）算參考向量。
+# 只在驗證 llama.cpp 的結果時使用，產品本身不需要 Python。
+# 建立方式：docker build -t rag-ref -f docker/Dockerfile.ref docker
+FROM python:3.11-slim
+
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+RUN pip install -U sentence-transformers transformers pillow numpy requests safetensors sentencepiece protobuf pymupdf
+
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+WORKDIR /rag

@@ -1,0 +1,15 @@
+# 開發與實驗用的映像檔：編譯 llama.cpp（Linux 版與 Windows 交叉編譯版）、跑量測腳本。
+# 建立方式：docker build -t rag-dev -f docker/Dockerfile.dev docker
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build ccache pkg-config \
+        g++-mingw-w64-x86-64-posix \
+        python3 python3-pip python3-venv python3-numpy python3-yaml python3-tqdm python3-requests python3-pil fonts-noto-cjk \
+        curl ca-certificates unzip xz-utils patch diffutils time procps libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix \
+    && update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+
+WORKDIR /rag

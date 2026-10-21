@@ -6,6 +6,8 @@
 !/實驗紀錄.md
 !/app/
 !/experiments/
+!/docker/
+!/patches/
 
 # 前端、Tauri 的編譯產出和套件
 node_modules/
