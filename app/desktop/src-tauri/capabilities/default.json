@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主視窗可以用的功能：基本功能，以及選擇資料夾的對話框。開啟檔案和讀頁面影像走自己的指令，會先檢查路徑。",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/rag_core", "crates/rag_models", "crates/rag_store", "crates/rag_ocr", "crates/rag_convert", "crates/rag_engine", "crates/rag_cli", "desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Qdrant Edge 0.8.0 加一處修改：flush 後清掉已寫入資料檔的寫入紀錄（WAL），否則紀錄檔永遠不會清（實驗 89）。
+[patch.crates-io]
+qdrant-edge = { path = "vendor/qdrant-edge-0.8.0" }

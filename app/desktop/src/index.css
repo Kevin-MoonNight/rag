@@ -1,0 +1,203 @@
+/*
+ * Token 一律照 UI設計規範.md：
+ * 顏色＝shadcn 官方 Blue 主題（baseColorsV4.blue，zinc 底＋blue 主色）原值；
+ * 主題沒有的顏色（brand、狀態、關鍵字標示）取 Tailwind 調色盤固定的階。
+ * 不要在這裡加規範外的數值。
+ */
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/noto-sans-tc";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    /* 英數 Geist（radix-nova 預設），中文思源黑體；都打包在程式裡 */
+    --font-sans: 'Geist Variable', 'Noto Sans TC Variable', 'Microsoft JhengHei UI', 'Microsoft JhengHei', sans-serif;
+    --color-brand: var(--brand);
+    --color-brand-subtle: var(--brand-subtle);
+    --color-success: var(--success);
+    --color-warning: var(--warning);
+    --color-highlight: var(--highlight);
+    --color-highlight-foreground: var(--highlight-foreground);
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    --radius: 0.625rem;
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.141 0.005 285.823);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.141 0.005 285.823);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.141 0.005 285.823);
+    --primary: oklch(0.488 0.243 264.376);
+    --primary-foreground: oklch(1 0 0); /* white（規範 1.1：hover 對比） */
+    --secondary: oklch(0.967 0.001 286.375);
+    --secondary-foreground: oklch(0.21 0.006 285.885);
+    --muted: oklch(0.967 0.001 286.375);
+    --muted-foreground: oklch(0.552 0.016 285.938);
+    --accent: oklch(0.967 0.001 286.375);
+    --accent-foreground: oklch(0.21 0.006 285.885);
+    --destructive: oklch(0.505 0.213 27.518); /* red-700（規範 1.1） */
+    --border: oklch(0.92 0.004 286.32);
+    --input: oklch(0.92 0.004 286.32);
+    --ring: oklch(0.556 0 0); /* neutral-500（規範 1.1） */
+    --chart-1: oklch(0.809 0.105 251.813);
+    --chart-2: oklch(0.623 0.214 259.815);
+    --chart-3: oklch(0.546 0.245 262.881);
+    --chart-4: oklch(0.488 0.243 264.376);
+    --chart-5: oklch(0.424 0.199 265.638);
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.141 0.005 285.823);
+    --sidebar-primary: oklch(0.546 0.245 262.881);
+    --sidebar-primary-foreground: oklch(0.97 0.014 254.604);
+    --sidebar-accent: oklch(0.967 0.001 286.375);
+    --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
+    --sidebar-border: oklch(0.92 0.004 286.32);
+    --sidebar-ring: oklch(0.556 0 0); /* neutral-500（規範 1.1） */
+    /* 規範 1.1 新增 token（Tailwind 調色盤） */
+    --brand: oklch(0.488 0.243 264.376); /* blue-700 */
+    --brand-subtle: oklch(0.97 0.014 254.604); /* blue-50 */
+    --success: oklch(0.508 0.118 165.612); /* emerald-700 */
+    --warning: oklch(0.555 0.163 48.998); /* amber-700 */
+    --highlight: oklch(0.945 0.129 101.54); /* yellow-200 */
+    --highlight-foreground: oklch(0.286 0.066 53.813); /* yellow-950 */
+}
+
+.dark {
+    --background: oklch(0.141 0.005 285.823);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.21 0.006 285.885);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.21 0.006 285.885);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.546 0.245 262.881); /* blue-600（規範 1.1） */
+    --primary-foreground: oklch(0.97 0.014 254.604);
+    --secondary: oklch(0.274 0.006 286.033);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.274 0.006 286.033);
+    --muted-foreground: oklch(0.705 0.015 286.067);
+    --accent: oklch(0.274 0.006 286.033);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.809 0.105 251.813);
+    --chart-2: oklch(0.623 0.214 259.815);
+    --chart-3: oklch(0.546 0.245 262.881);
+    --chart-4: oklch(0.488 0.243 264.376);
+    --chart-5: oklch(0.424 0.199 265.638);
+    --sidebar: oklch(0.21 0.006 285.885);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.623 0.214 259.815);
+    --sidebar-primary-foreground: oklch(0.97 0.014 254.604);
+    --sidebar-accent: oklch(0.274 0.006 286.033);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0); /* neutral-500（規範 1.1） */
+    --brand: oklch(0.707 0.165 254.624); /* blue-400 */
+    --brand-subtle: oklch(0.282 0.091 267.935); /* blue-950 */
+    --success: oklch(0.765 0.177 163.223); /* emerald-400 */
+    --warning: oklch(0.828 0.189 84.429); /* amber-400 */
+    --highlight: oklch(0.852 0.199 91.936 / 25%); /* yellow-400 25% */
+    --highlight-foreground: oklch(0.973 0.071 103.193); /* yellow-100 */
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  button:not(:disabled), [role="button"]:not(:disabled) {
+    cursor: pointer;
+    }
+  html {
+    @apply font-sans;
+    }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    /* 規範 E10：介面字不會被拖選；檔名、路徑、段落、回答另外加 select-text */
+    user-select: none;
+  }
+  /* 規範 E6：關鍵字標示；Windows 高對比模式會拿掉底色，改用外框 */
+  mark {
+    @apply rounded-sm bg-highlight px-0.5 text-highlight-foreground;
+  }
+  @media (forced-colors: active) {
+    mark {
+      outline: 1px solid Highlight;
+    }
+  }
+}
+
+/* 規範 E7：回答逐字出現時，結尾的游標；減少動畫時是不閃的實心方塊 */
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+.answer-caret::after {
+  content: "";
+  display: inline-block;
+  width: 0.45em;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--brand);
+  animation: caret-blink 1s step-end infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .answer-caret::after {
+    animation: none;
+  }
+}

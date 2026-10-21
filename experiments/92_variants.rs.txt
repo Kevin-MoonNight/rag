@@ -1,0 +1,46 @@
+// 實驗 92 用過、未採用的版本（rag_core/src/text.rs 的 query_sparse 與查詢分類；search.rs 依 RAG_KW_FIRST=code|style 改用關鍵字先的輪流合併）
+/// 查詢的稀疏向量：每個出現的詞權重 1。
+pub fn query_sparse(text: &str) -> SparseVec {
+    // 實驗 92：查詢端的詞權重（英數詞、中文單字），用環境變數試，預設 1
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+    let (word_w, uni_w) = (env("RAG_KW_WORD_W"), env("RAG_KW_UNI_W"));
+    let tokens = keyword_tokens(&normalize(text));
+    let mut pairs: Vec<(u32, f32)> = tokens
+        .iter()
+        .map(|t| {
+            let w = if !t.chars().any(is_cjk) {
+                word_w
+            } else if t.chars().count() == 1 {
+                uni_w
+            } else {
+                1.0
+            };
+            (term_id(t), w)
+        })
+        .collect();
+    pairs.sort_by_key(|p| p.0);
+    pairs.dedup_by_key(|p| p.0);
+    to_sparse(pairs)
+}
+
+/// 查詢裡有沒有代號樣式的字串（實驗 92）：英數、點、連字號連成的一段，含數字，且長度 5 以上、
+/// 或同時有英文字母和數字且長度 4 以上。例：17025B、FL005713、E45004、2936.26.00.00-5。年份（2024）不算。
+pub fn has_code(query: &str) -> bool {
+    let q = normalize(query);
+    q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+        .map(|s| s.trim_matches(|c| c == '.' || c == '-' || c == '_'))
+        .any(|s| {
+            let digit = s.chars().any(|c| c.is_ascii_digit());
+            let letter = s.chars().any(|c| c.is_ascii_alphabetic());
+            digit && (s.len() >= 5 || (letter && s.len() >= 4))
+        })
+}
+
+/// 查詢像不像一串關鍵詞而不是一句問句（實驗 92）：沒有疑問詞、中文字不多、英文字不超過 2 個。
+pub fn keyword_style(query: &str) -> bool {
+    const ASK: [&str; 14] = ["嗎", "什麼", "甚麼", "哪", "多少", "幾", "如何", "怎", "是否", "能否", "可否", "為何", "?", "？"];
+    let q = normalize(query);
+    let cjk = q.chars().filter(|&c| is_cjk(c)).count();
+    let words = q.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| w.len() >= 2).count();
+    !ASK.iter().any(|a| q.contains(a)) && cjk <= 14 && words <= 2
+}

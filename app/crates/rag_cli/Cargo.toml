@@ -1,0 +1,19 @@
+[package]
+name = "rag_cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rag"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rag_core = { path = "../rag_core" }
+rag_convert = { path = "../rag_convert" }
+rag_engine = { path = "../rag_engine" }
+rag_models = { path = "../rag_models" }
+rag_store = { path = "../rag_store" }

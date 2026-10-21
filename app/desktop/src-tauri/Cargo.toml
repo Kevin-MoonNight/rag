@@ -1,0 +1,33 @@
+[package]
+name = "rag_desktop"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "rag-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+rag_engine = { path = "../../crates/rag_engine" }
+
+# 視窗縮到最小時直接呼叫 WebView2 降低記憶體（實驗 90）；版本和 tauri 用的一致，不會多下載
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
+
+[features]
+# 正式版要開：把前端打包進執行檔，不連開發伺服器
+custom-protocol = ["tauri/custom-protocol"]

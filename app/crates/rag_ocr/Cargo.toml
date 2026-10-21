@@ -1,0 +1,13 @@
+[package]
+name = "rag_ocr"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# PP-OCR 的偵測和辨識模型用 ONNX Runtime 執行（實驗 99）。ONNX Runtime 在執行時才載入（微軟官方的 onnxruntime.dll／libonnxruntime.so）：
+# ort 沒有 x86_64-pc-windows-gnu 的預編譯檔，而官方的 DLL 走 C API，GNU 編出來的程式也能載入。
+oar-ocr = { version = "0.10.0", default-features = false, features = ["simd"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg"] }

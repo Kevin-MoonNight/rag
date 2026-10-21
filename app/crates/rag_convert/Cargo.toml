@@ -1,0 +1,12 @@
+[package]
+name = "rag_convert"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rag_core = { path = "../rag_core" }
+liteparse = { version = "2.16.0", default-features = false }
+tokio = { version = "1", features = ["rt"] }
+rag_ocr = { path = "../rag_ocr" }

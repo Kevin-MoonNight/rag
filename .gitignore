@@ -1,0 +1,21 @@
+# 只收原始碼、實驗腳本和文件。模型、執行檔、索引、測試文件、下載和編譯產出都很大或不該進版本控制。
+/*
+!/.gitignore
+!/README.md
+!/進度.md
+!/實驗紀錄.md
+!/app/
+!/experiments/
+
+# 前端、Tauri 的編譯產出和套件
+node_modules/
+/app/desktop/dist/
+/app/desktop/src-tauri/gen/
+target/
+
+# 執行時產生的
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

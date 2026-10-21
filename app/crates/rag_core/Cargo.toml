@@ -1,0 +1,12 @@
+[package]
+name = "rag_core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+sha2.workspace = true
+# 相容漢字換成一般漢字（PDF 抽出的字常是相容區的編碼）
+unicode-normalization = "0.1"
